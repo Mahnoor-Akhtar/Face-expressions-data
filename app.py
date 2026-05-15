@@ -30,6 +30,18 @@ except Exception as exc:
     metrics_collection = None
     print(f"--- MongoDB cache disabled: {exc} ---")
 
+# Predictions collection (stores each prediction request/result)
+predictions_collection = None
+try:
+    if mongo_client is not None:
+        predictions_collection = mongo_client[MONGO_DB_NAME]["predictions"]
+        predictions_collection.create_index("timestamp")
+        predictions_collection.create_index("image_hash")
+        print("--- MongoDB connected for predictions storage ---")
+except Exception as exc:
+    predictions_collection = None
+    print(f"--- MongoDB predictions disabled: {exc} ---")
+
 # 1. CNN Model aur Face Cascade Load karein
 MODEL_PATH = 'models/emotion_cnn_model.h5'
 
@@ -257,6 +269,23 @@ def predict():
         max_index = int(np.argmax(prediction[0]))
         predicted_emotion = EMOTIONS[max_index]
 
+        # Attempt to store prediction record in MongoDB (if available)
+        try:
+            if predictions_collection is not None:
+                # Hash image bytes to avoid storing raw images
+                image_hash = hashlib.sha256(img_data).hexdigest()
+                record = {
+                    "predicted_emotion": predicted_emotion,
+                    "probabilities": [float(x) for x in prediction[0].tolist()],
+                    "timestamp": datetime.now(timezone.utc),
+                    "image_hash": image_hash,
+                }
+                predictions_collection.insert_one(record)
+        except Exception as _:
+            # Fail silently to avoid changing API behavior
+            pass
+
+        # Keep response identical to previous behavior
         return jsonify({"emotion": predicted_emotion})
 
     except Exception as e:
@@ -288,6 +317,30 @@ def models_metrics():
         return jsonify(payload)
     except Exception as e:
         print(f"Metrics Error: {e}")
+        return jsonify({"error": "Server Error"}), 500
+
+
+@app.route('/api/reports/generate', methods=['GET'])
+def generate_report():
+    """Return a report of all stored predictions.
+
+    Response format: JSON list of records with timestamp, predicted_emotion,
+    probabilities, and image_hash. If MongoDB is not configured, returns 503.
+    """
+    try:
+        if predictions_collection is None:
+            return jsonify({"error": "Predictions storage not configured"}), 503
+
+        docs = list(predictions_collection.find({}, {"_id": 0}).sort("timestamp", 1))
+        # Convert datetimes to ISO
+        for d in docs:
+            ts = d.get("timestamp")
+            if isinstance(ts, datetime):
+                d["timestamp"] = ts.isoformat()
+
+        return jsonify({"count": len(docs), "predictions": docs})
+    except Exception as e:
+        print(f"Report Error: {e}")
         return jsonify({"error": "Server Error"}), 500
 
 if __name__ == '__main__':
