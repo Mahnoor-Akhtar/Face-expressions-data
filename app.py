@@ -51,6 +51,22 @@ if os.path.exists(MODEL_PATH):
 else:
     print("ERROR: Model file not found! Please train the CNN first.")
 
+# Try to load alternative models (logistic variants) if present
+LOGISTIC_PATH = 'modelss/emotion_model.pkl'
+LOGISTIC_BALANCED_PATH = 'modelsss/emotion_model.pkl'
+logistic_model = None
+logistic_balanced_model = None
+try:
+    if os.path.exists(LOGISTIC_PATH):
+        logistic_model = joblib.load(LOGISTIC_PATH)
+        print("--- Logistic model loaded ---")
+    if os.path.exists(LOGISTIC_BALANCED_PATH):
+        logistic_balanced_model = joblib.load(LOGISTIC_BALANCED_PATH)
+        print("--- Balanced logistic model loaded ---")
+except Exception as _:
+    logistic_model = None
+    logistic_balanced_model = None
+
 face_cascade = cv2.CascadeClassifier(cv2.data.haarcascades + 'haarcascade_frontalface_default.xml')
 
 # Emotions ki list (Sequence wahi rakhni hai jo training mein thi)
@@ -264,10 +280,49 @@ def predict():
         # Preprocessing: Shape (1, 48, 48, 1) aur Normalize (/255)
         roi_final = roi_resized.reshape(1, 48, 48, 1).astype('float32') / 255.0
         
-        # Model Prediction
-        prediction = model.predict(roi_final, verbose=0) # verbose=0 taake terminal mein extra logs na aayein
-        max_index = int(np.argmax(prediction[0]))
-        predicted_emotion = EMOTIONS[max_index]
+        # Model selection (default to CNN)
+        model_choice = request.json.get('model', 'cnn')
+        predicted_emotion = 'Neutral'
+        probs = None
+
+        if model_choice == 'cnn' or model is None:
+            # CNN prediction (default)
+            prediction = model.predict(roi_final, verbose=0)
+            probs = [float(x) for x in prediction[0].tolist()]
+            max_index = int(np.argmax(prediction[0]))
+            predicted_emotion = EMOTIONS[max_index]
+        elif model_choice == 'logistic' and logistic_model is not None:
+            roi_flat = roi_resized.flatten().reshape(1, -1).astype('float32') / 255.0
+            try:
+                probs_arr = logistic_model.predict_proba(roi_flat)
+                probs = [float(x) for x in probs_arr[0].tolist()]
+            except Exception:
+                # fallback: predict only
+                pred = logistic_model.predict(roi_flat)
+                probs = [0.0] * len(EMOTIONS)
+                probs[int(pred[0])] = 1.0
+            max_index = int(np.argmax(probs))
+            predicted_emotion = EMOTIONS[max_index]
+        elif model_choice == 'logistic_balanced' and logistic_balanced_model is not None:
+            roi_flat = roi_resized.flatten().reshape(1, -1).astype('float32') / 255.0
+            try:
+                probs_arr = logistic_balanced_model.predict_proba(roi_flat)
+                probs = [float(x) for x in probs_arr[0].tolist()]
+            except Exception:
+                pred = logistic_balanced_model.predict(roi_flat)
+                probs = [0.0] * len(EMOTIONS)
+                probs[int(pred[0])] = 1.0
+            max_index = int(np.argmax(probs))
+            predicted_emotion = EMOTIONS[max_index]
+        else:
+            # If requested model not available, fall back to CNN if possible
+            if model is not None:
+                prediction = model.predict(roi_final, verbose=0)
+                probs = [float(x) for x in prediction[0].tolist()]
+                max_index = int(np.argmax(prediction[0]))
+                predicted_emotion = EMOTIONS[max_index]
+            else:
+                return jsonify({"emotion": "Model Not Available"}), 400
 
         # Attempt to store prediction record in MongoDB (if available)
         try:
@@ -276,9 +331,10 @@ def predict():
                 image_hash = hashlib.sha256(img_data).hexdigest()
                 record = {
                     "predicted_emotion": predicted_emotion,
-                    "probabilities": [float(x) for x in prediction[0].tolist()],
+                    "probabilities": probs if probs is not None else [],
                     "timestamp": datetime.now(timezone.utc),
                     "image_hash": image_hash,
+                    "model_used": model_choice if 'model_choice' in locals() else 'cnn',
                 }
                 predictions_collection.insert_one(record)
         except Exception as _:
@@ -331,14 +387,23 @@ def generate_report():
         if predictions_collection is None:
             return jsonify({"error": "Predictions storage not configured"}), 503
 
-        docs = list(predictions_collection.find({}, {"_id": 0}).sort("timestamp", 1))
-        # Convert datetimes to ISO
+        # Return full documents so frontend can display all stored fields
+        docs = list(predictions_collection.find({}).sort("timestamp", 1))
+        out = []
         for d in docs:
-            ts = d.get("timestamp")
+            doc = dict(d)
+            _id = doc.get("_id")
+            if _id is not None:
+                try:
+                    doc["_id"] = str(_id)
+                except Exception:
+                    doc["_id"] = repr(_id)
+            ts = doc.get("timestamp")
             if isinstance(ts, datetime):
-                d["timestamp"] = ts.isoformat()
+                doc["timestamp"] = ts.isoformat()
+            out.append(doc)
 
-        return jsonify({"count": len(docs), "predictions": docs})
+        return jsonify({"count": len(out), "predictions": out})
     except Exception as e:
         print(f"Report Error: {e}")
         return jsonify({"error": "Server Error"}), 500
