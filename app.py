@@ -1,13 +1,34 @@
 import os
+import hashlib
+from datetime import datetime, timezone
 import cv2
 import numpy as np
 import tensorflow as tf
 import base64
+import joblib
 from flask import Flask, request, jsonify
 from flask_cors import CORS
+from pymongo import MongoClient  # type: ignore[reportMissingImports]
+from sklearn.metrics import accuracy_score, precision_recall_fscore_support, confusion_matrix, classification_report
 
 app = Flask(__name__)
 CORS(app)  # React frontend se connection ke liye zaroori hai
+
+MONGO_URI = os.getenv("MONGO_URI", "mongodb://127.0.0.1:27017")
+MONGO_DB_NAME = os.getenv("MONGO_DB_NAME", "emosense_ai")
+MONGO_COLLECTION_NAME = os.getenv("MONGO_COLLECTION_NAME", "model_metrics")
+
+metrics_collection = None
+try:
+    mongo_client = MongoClient(MONGO_URI, serverSelectionTimeoutMS=1500)
+    mongo_client.admin.command("ping")
+    metrics_collection = mongo_client[MONGO_DB_NAME][MONGO_COLLECTION_NAME]
+    metrics_collection.create_index("cache_key", unique=True)
+    metrics_collection.create_index("updated_at")
+    print("--- MongoDB connected for metrics cache ---")
+except Exception as exc:
+    metrics_collection = None
+    print(f"--- MongoDB cache disabled: {exc} ---")
 
 # 1. CNN Model aur Face Cascade Load karein
 MODEL_PATH = 'models/emotion_cnn_model.h5'
@@ -22,6 +43,183 @@ face_cascade = cv2.CascadeClassifier(cv2.data.haarcascades + 'haarcascade_fronta
 
 # Emotions ki list (Sequence wahi rakhni hai jo training mein thi)
 EMOTIONS = ["Angry", "Disgust", "Fear", "Happy", "Neutral", "Sad", "Surprise"]
+
+
+def get_file_signature(file_path):
+    if not os.path.exists(file_path):
+        return "missing"
+    stat = os.stat(file_path)
+    payload = f"{os.path.abspath(file_path)}:{stat.st_mtime_ns}:{stat.st_size}"
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def build_cache_key():
+    source_bits = [
+        "v3",
+        get_file_signature('models/emotion_cnn_model.h5'),
+        get_file_signature('modelss/emotion_model.pkl'),
+        get_file_signature('modelsss/emotion_model.pkl'),
+        get_file_signature('data/test'),
+    ]
+    return hashlib.sha256("|".join(source_bits).encode("utf-8")).hexdigest()
+
+
+def load_metrics_cache(cache_key):
+    if metrics_collection is None:
+        return None
+    doc = metrics_collection.find_one({"cache_key": cache_key}, {"_id": 0})
+    if not doc:
+        return None
+    results = doc.get("results") or {}
+    results["cache_key"] = doc.get("cache_key")
+    results["cached"] = True
+    updated_at = doc.get("updated_at")
+    results["cached_at"] = updated_at.isoformat() if updated_at else None
+    return results
+
+
+def cache_is_complete(results):
+    required_models = ["cnn", "logistic", "logistic_balanced"]
+    required_summary_keys = ["accuracy", "macro_avg", "weighted_avg", "per_class", "confusion_matrix"]
+    for model_key in required_models:
+        model = results.get(model_key)
+        if not model:
+            return False
+        for field in required_summary_keys:
+            if field not in model:
+                return False
+        if not model.get("per_class"):
+            return False
+    return True
+
+
+def store_metrics_cache(cache_key, results):
+    if metrics_collection is None:
+        return
+    metrics_collection.update_one(
+        {"cache_key": cache_key},
+        {
+            "$set": {
+                "cache_key": cache_key,
+                "results": results,
+                "updated_at": datetime.now(timezone.utc),
+            }
+        },
+        upsert=True,
+    )
+
+
+def compute_model_metrics():
+    CATEGORIES = ["angry", "disgust", "fear", "happy", "neutral", "sad", "surprise"]
+    TEST_DIR = 'data/test/'
+
+    X_test_cnn = []
+    X_test_logistic = []
+    y_true = []
+    for category in CATEGORIES:
+        path = os.path.join(TEST_DIR, category)
+        label = CATEGORIES.index(category)
+        if not os.path.exists(path):
+            continue
+        for img_name in os.listdir(path):
+            try:
+                img_path = os.path.join(path, img_name)
+                image = cv2.imread(img_path, cv2.IMREAD_GRAYSCALE)
+                image = cv2.resize(image, (48, 48))
+                X_test_cnn.append(image)
+                X_test_logistic.append(image.flatten())
+                y_true.append(label)
+            except:
+                continue
+
+    if len(y_true) == 0:
+        return None, {"error": "No test data found"}
+
+    X_test_cnn = np.array(X_test_cnn).reshape(-1, 48, 48, 1) / 255.0
+    X_test_logistic = np.array(X_test_logistic) / 255.0
+    y_true = np.array(y_true)
+
+    results = {}
+
+    cnn_path = 'models/emotion_cnn_model.h5'
+    if os.path.exists(cnn_path):
+        cnn_model = tf.keras.models.load_model(cnn_path)
+        preds = cnn_model.predict(X_test_cnn, verbose=0)
+        y_pred_cnn = np.argmax(preds, axis=1)
+
+        acc = float(accuracy_score(y_true, y_pred_cnn))
+        report = classification_report(y_true, y_pred_cnn, target_names=CATEGORIES, output_dict=True, zero_division=0)
+        prec, rec, f1, sup = precision_recall_fscore_support(y_true, y_pred_cnn, zero_division=0)
+        cm = confusion_matrix(y_true, y_pred_cnn).tolist()
+
+        per_class = {}
+        for i, cat in enumerate(CATEGORIES):
+            per_class[cat] = {
+                'precision': float(prec[i]),
+                'recall': float(rec[i]),
+                'f1': float(f1[i]),
+                'support': int(sup[i])
+            }
+
+        results['cnn'] = {
+            'accuracy': acc,
+            'macro_avg': {
+                'precision': float(report['macro avg']['precision']),
+                'recall': float(report['macro avg']['recall']),
+                'f1': float(report['macro avg']['f1-score']),
+            },
+            'weighted_avg': {
+                'precision': float(report['weighted avg']['precision']),
+                'recall': float(report['weighted avg']['recall']),
+                'f1': float(report['weighted avg']['f1-score']),
+            },
+            'per_class': per_class,
+            'confusion_matrix': cm
+        }
+
+    for model_key, model_path, label_name in [
+        ('logistic', 'modelss/emotion_model.pkl', 'Logistic Regression'),
+        ('logistic_balanced', 'modelsss/emotion_model.pkl', 'Balanced Logistic Regression'),
+    ]:
+        if os.path.exists(model_path):
+            log_model = joblib.load(model_path)
+            y_pred_log = log_model.predict(X_test_logistic)
+
+            acc = float(accuracy_score(y_true, y_pred_log))
+            report = classification_report(y_true, y_pred_log, target_names=CATEGORIES, output_dict=True, zero_division=0)
+            prec, rec, f1, sup = precision_recall_fscore_support(y_true, y_pred_log, zero_division=0)
+            cm = confusion_matrix(y_true, y_pred_log).tolist()
+
+            per_class = {}
+            for i, cat in enumerate(CATEGORIES):
+                per_class[cat] = {
+                    'precision': float(prec[i]),
+                    'recall': float(rec[i]),
+                    'f1': float(f1[i]),
+                    'support': int(sup[i])
+                }
+
+            results[model_key] = {
+                'label': label_name,
+                'accuracy': acc,
+                'macro_avg': {
+                    'precision': float(report['macro avg']['precision']),
+                    'recall': float(report['macro avg']['recall']),
+                    'f1': float(report['macro avg']['f1-score']),
+                },
+                'weighted_avg': {
+                    'precision': float(report['weighted avg']['precision']),
+                    'recall': float(report['weighted avg']['recall']),
+                    'f1': float(report['weighted avg']['f1-score']),
+                },
+                'per_class': per_class,
+                'confusion_matrix': cm
+            }
+
+    if not results:
+        return None, {"error": "No models found"}
+
+    return results, None
 
 @app.route('/predict', methods=['POST'])
 def predict():
@@ -64,6 +262,33 @@ def predict():
     except Exception as e:
         print(f"Backend Error: {e}")
         return jsonify({"emotion": "Server Error"})
+
+
+@app.route('/api/models/metrics', methods=['GET'])
+def models_metrics():
+    try:
+        refresh = request.args.get("refresh", "0") == "1"
+        cache_key = build_cache_key()
+
+        if not refresh:
+            cached = load_metrics_cache(cache_key)
+            if cached and cache_is_complete(cached):
+                return jsonify(cached)
+
+        results, error = compute_model_metrics()
+        if error:
+            return jsonify(error), 400
+
+        payload = dict(results)
+        payload["cache_key"] = cache_key
+        payload["cached"] = False
+        payload["generated_at"] = datetime.now(timezone.utc).isoformat()
+
+        store_metrics_cache(cache_key, results)
+        return jsonify(payload)
+    except Exception as e:
+        print(f"Metrics Error: {e}")
+        return jsonify({"error": "Server Error"}), 500
 
 if __name__ == '__main__':
     # Debug mode on rakhein taake koi bhi error terminal mein foran nazar aaye
