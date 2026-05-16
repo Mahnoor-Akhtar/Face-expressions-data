@@ -45,6 +45,7 @@ except Exception as exc:
 # 1. CNN Model aur Face Cascade Load karein
 MODEL_PATH = 'models/emotion_cnn_model.h5'
 
+model = None  # default to None so NameError never occurs
 if os.path.exists(MODEL_PATH):
     model = tf.keras.models.load_model(MODEL_PATH)
     print("--- CNN Model Loaded Successfully ---")
@@ -285,7 +286,7 @@ def predict():
         predicted_emotion = 'Neutral'
         probs = None
 
-        if model_choice == 'cnn' or model is None:
+        if model_choice == 'cnn' and model is not None:
             # CNN prediction (default)
             prediction = model.predict(roi_final, verbose=0)
             probs = [float(x) for x in prediction[0].tolist()]
@@ -341,12 +342,23 @@ def predict():
             # Fail silently to avoid changing API behavior
             pass
 
-        # Keep response identical to previous behavior
-        return jsonify({"emotion": predicted_emotion})
+        # Return emotion + probabilities so frontend can show real confidence
+        emotion_probs = {}
+        if probs is not None:
+            for i, emo in enumerate(EMOTIONS):
+                emotion_probs[emo] = round(float(probs[i]) * 100, 2)
+
+        return jsonify({
+            "emotion": predicted_emotion,
+            "probabilities": emotion_probs,
+            "model_used": model_choice,
+        })
 
     except Exception as e:
+        import traceback
         print(f"Backend Error: {e}")
-        return jsonify({"emotion": "Server Error"})
+        traceback.print_exc()
+        return jsonify({"error": "Server Error", "emotion": "Server Error"}), 500
 
 
 @app.route('/api/models/metrics', methods=['GET'])
@@ -373,6 +385,70 @@ def models_metrics():
         return jsonify(payload)
     except Exception as e:
         print(f"Metrics Error: {e}")
+        return jsonify({"error": "Server Error"}), 500
+
+
+@app.route('/api/dataset/analysis', methods=['GET'])
+def dataset_analysis():
+    """Return dataset statistics for all emotion classes."""
+    try:
+        data_dir = "data"
+        train_dir = os.path.join(data_dir, "train")
+        test_dir = os.path.join(data_dir, "test")
+        
+        emotions = ["angry", "disgust", "fear", "happy", "neutral", "sad", "surprise"]
+        results = []
+        
+        for emotion in emotions:
+            train_path = os.path.join(train_dir, emotion)
+            test_path = os.path.join(test_dir, emotion)
+            
+            # Count files
+            train_count = len([f for f in os.listdir(train_path) if f.endswith('.jpg')]) if os.path.exists(train_path) else 0
+            test_count = len([f for f in os.listdir(test_path) if f.endswith('.jpg')]) if os.path.exists(test_path) else 0
+            total_count = train_count + test_count
+            
+            train_pct = (train_count / total_count * 100) if total_count > 0 else 0
+            test_pct = (test_count / total_count * 100) if total_count > 0 else 0
+            
+            results.append({
+                "emotion": emotion.upper(),
+                "training": train_count,
+                "testing": test_count,
+                "total": total_count,
+                "train_percentage": round(train_pct, 1),
+                "test_percentage": round(test_pct, 1)
+            })
+        
+        # Summary statistics
+        total_train = sum(r["training"] for r in results)
+        total_test = sum(r["testing"] for r in results)
+        total_all = total_train + total_test
+        
+        totals = [r["total"] for r in results]
+        min_samples = min(totals) if totals else 0
+        max_samples = max(totals) if totals else 0
+        avg_samples = total_all / len(emotions) if emotions else 0
+        
+        imbalance_ratio = max_samples / min_samples if min_samples > 0 else 0
+        
+        return jsonify({
+            "classes": results,
+            "summary": {
+                "total_training": total_train,
+                "total_testing": total_test,
+                "grand_total": total_all,
+                "train_percentage": round((total_train / total_all * 100), 1) if total_all > 0 else 0,
+                "test_percentage": round((total_test / total_all * 100), 1) if total_all > 0 else 0,
+                "min_samples_per_class": min_samples,
+                "max_samples_per_class": max_samples,
+                "avg_samples_per_class": round(avg_samples, 1),
+                "imbalance_ratio": round(imbalance_ratio, 2),
+                "has_imbalance": imbalance_ratio > 2.0
+            }
+        })
+    except Exception as e:
+        print(f"Dataset Analysis Error: {e}")
         return jsonify({"error": "Server Error"}), 500
 
 
